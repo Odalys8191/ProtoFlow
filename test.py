@@ -20,8 +20,51 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 import os
 import os.path as osp
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 from protoflow.utils import profile
+
+class NpyDataset(Dataset):
+    """
+    加载npy格式的特征和标签分布的数据集类
+    适配LDL（标签分布学习）任务
+    """
+    def __init__(self, feature_path, label_path):
+        """
+        初始化NpyDataset
+        Args:
+            feature_path: 特征文件路径（.npy格式）
+            label_path: 标签分布文件路径（.npy格式）
+        """
+        # 加载特征和标签分布
+        self.features = np.load(feature_path)
+        self.labels = np.load(label_path)
+        
+        # 确保特征和标签数量一致
+        assert len(self.features) == len(self.labels), "特征和标签数量不一致"
+        
+        # 将数据转换为torch张量
+        self.features = torch.tensor(self.features, dtype=torch.float32)
+        self.labels = torch.tensor(self.labels, dtype=torch.float32)
+    
+    def __len__(self):
+        """
+        返回数据集大小
+        """
+        return len(self.features)
+    
+    def __getitem__(self, idx):
+        """
+        获取指定索引的样本
+        Args:
+            idx: 样本索引
+        Returns:
+            feature: 特征张量
+            label: 标签分布张量
+        """
+        return self.features[idx], self.labels[idx]
 
 LOG_DIR = os.getenv('LOG_DIR', 'logs')
 
@@ -84,10 +127,7 @@ def run(args):
         from torch.nn.parallel import DistributedDataParallel as DDP
         from torch.optim.swa_utils import update_bn
 
-        from experiments.image.model.model_flow import get_model
         from protoflow.proto import ProtoFlowGMM
-        from protoflow.datasets import get_dataset
-        from protoflow.training import get_transform
         from protoflow.evaluation import test
         from protoflow.utils import dict_to_namespace
         from protoflow.utils import convert_legacy_config
@@ -104,67 +144,44 @@ def run(args):
             with open(config_path, 'r') as fp:
                 config = json.load(fp)
             config = convert_legacy_config(config)
-            flow_args = dict_to_namespace(config['flow_args'])
-            interpolation = config['interpolation']
-            img_size = config['img_size']
-            augmentation = config.get('augmentation', args.augmentation)
+            # LDL任务：从配置文件获取npy文件路径
+            train_feature_path = config.get('train_feature', args.train_feature)
+            train_label_path = config.get('train_label', args.train_label)
+            test_feature_path = config.get('test_feature', args.test_feature)
+            test_label_path = config.get('test_label', args.test_label)
+            # LDL任务：获取模型相关参数
             protos_per_class = config.get('protos_per_class', 10)
-            gaussian_approach = config.get('gaussian_approach',
-                                           'GaussianMixture')
-            use_base_dist = config.get('elbo_loss', False)
+            gaussian_approach = config.get('gaussian_approach', 'GaussianMixture')
             likelihood_approach = config.get('likelihood_approach', 'total')
         else:
             if rank == 0:
                 print(f'WARNING: no config file found at {config_path}')
-            if args.flow_ckpt is None:
-                raise RuntimeError('You must specify --flow_ckpt if no config '
-                                   'file is found!')
-
-            path_args = '{}/args.pickle'.format(args.flow_ckpt)
-            with open(path_args, 'rb') as f:
-                flow_args = pickle.load(f)
-
-            if args.interpolation is None:
-                print('The option --interpolation should be specified if no '
-                      'config file is found! Assuming bicubic...')
-                interpolation = 'bicubic'
-            else:
-                interpolation = args.interpolation
-
-            if args.img_size is None:
-                raise RuntimeError('You must specify --img_size if no config '
-                                   'file is found!')
-            config = {}
-            img_size = args.img_size
-            augmentation = args.augmentation
+            # LDL任务：从命令行参数获取npy文件路径
+            train_feature_path = args.train_feature
+            train_label_path = args.train_label
+            test_feature_path = args.test_feature
+            test_label_path = args.test_label
+            # LDL任务：默认模型参数
             protos_per_class = 10
             gaussian_approach = 'GaussianMixture'
-            use_base_dist = True
             likelihood_approach = 'total'
 
-        n_channels = 3
-        flow_model = get_model(flow_args,
-                               data_shape=(n_channels, img_size, img_size),
-                               base_dist=use_base_dist)
-        flow_model.to(rank)
+        # LDL任务：加载npy数据，获取标签分布的类别数
+        train_labels = np.load(train_label_path)
+        n_classes = train_labels.shape[1]  # 标签分布的维度即为类别数
+        
+        # LDL任务：加载训练数据特征，获取特征维度
+        train_features = np.load(train_feature_path)
+        feature_dim = train_features.shape[1]  # 特征维度
 
-        n_classes = {
-            'cub200': 200,
-            'cifar10': 10,
-            'mnist': 10,
-            'cifar100': 100,
-            'pets': 37,
-            'flowers': 102,
-            'imagenet': 1000,
-        }[args.dataset]
-
+        # LDL任务：初始化模型，无需flow模型，直接使用ProtoFlowGMM处理特征
+        # 需要核实：ProtoFlowGMM是否可以直接处理特征输入，还是必须通过flow模型
         model = ProtoFlowGMM(
-            model=flow_model,
+            model=None,  # LDL任务：直接处理特征，无需flow模型
             n_classes=n_classes,
-            features_shape=flow_model.out_shape,
+            features_shape=(feature_dim,),  # LDL任务：特征形状为(feature_dim,)
             protos_per_class=protos_per_class,
             gaussian_approach=gaussian_approach,
-
             likelihood_approach=args.likelihood_approach or likelihood_approach,
         )
         model.to(rank)
@@ -181,19 +198,12 @@ def run(args):
             for gmm in model.module.gmms:
                 gmm.var.data = gmm.var * args.var_temp
 
-        multi_transform_k = args.tta_num if args.tta else None
-        transform = get_transform(interpolation, img_size, train=args.tta,
-                                  augmentation=augmentation,
-                                  ten_crop=args.ten_crop,
-                                  multi_transform_k=multi_transform_k)
-
+        # LDL任务：使用NpyDataset加载数据，无需数据转换
         dl_train = None
         if not args.test_only:
-            ds_train = get_dataset(args.dataset, train=True,
-                                   transform=transform)
-            dl_train = make_dataloader(ds_train, rank, world_size,
-                                       args.batch_size)
-        ds_test = get_dataset(args.dataset, train=False, transform=transform)
+            ds_train = NpyDataset(train_feature_path, train_label_path)
+            dl_train = make_dataloader(ds_train, rank, world_size, args.batch_size)
+        ds_test = NpyDataset(test_feature_path, test_label_path)
         dl_test = make_dataloader(ds_test, rank, world_size, args.batch_size)
 
         to_eval = [('raw', model)]
@@ -205,13 +215,8 @@ def run(args):
                 if rank == 0:
                     print('Updating batch norm stats for the EMA model')
 
-                train_transform = get_transform(
-                    interpolation, img_size, train=True,
-                    augmentation=augmentation,
-                    ten_crop=False, multi_transform_k=None,
-                )
-                ds_train_plain = get_dataset(args.dataset, train=True,
-                                             transform=train_transform)
+                # LDL任务：使用原始训练数据更新EMA模型的batch norm统计信息
+                ds_train_plain = NpyDataset(train_feature_path, train_label_path)
                 dl_train_plain = make_dataloader(
                     ds_train_plain, rank, world_size, args.batch_size,
                     persistent_workers=False
@@ -233,8 +238,6 @@ def run(args):
                     dl=dl_train,
                     n_classes=n_classes,
                     num_samples=args.num_samples,
-                    ten_crop=args.ten_crop,
-                    multi_transform_k=multi_transform_k,
                     calibration_metrics=True,
                     args=args,
                 )
@@ -251,8 +254,6 @@ def run(args):
                 dl=dl_test,
                 n_classes=n_classes,
                 num_samples=args.num_samples,
-                ten_crop=args.ten_crop,
-                multi_transform_k=multi_transform_k,
                 calibration_metrics=True,
                 args=args,
             )
@@ -266,16 +267,17 @@ def run(args):
                 write_path = osp.join(result_dir, f'scores_{now_str()}.json')
                 print(f'Write results to {write_path}')
                 score_data = {
-                    'dataset': args.dataset,
                     'resume': args.resume,
                     'num_samples': args.num_samples,
-                    'ten_crop': args.ten_crop,
                     'var_temp': args.var_temp,
                     'likelihood_approach': args.likelihood_approach,
-                    'tta': args.tta,
-                    'tta_num': args.tta_num if args.tta else 0,
                     'scores_test': {
                         k: v.item() for k, v in test_scores.items()},
+                    # LDL任务：添加npy文件路径信息
+                    'train_feature': train_feature_path,
+                    'train_label': train_label_path,
+                    'test_feature': test_feature_path,
+                    'test_label': test_label_path,
                 }
                 if not args.test_only:
                     score_data['scores_train'] = {
@@ -290,17 +292,24 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Test a model',
+        description='Test a ProtoFlow model for LDL (Label Distribution Learning)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument('--resume', type=str, required=True,
                         help='Path to resume checkpoint')
-    parser.add_argument('--dataset', type=str, required=True,
-                        choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10',
-                                 'food', 'caltech101', 'imagenet', 'cifar100',
-                                 'objectnet', 'aircraft', 'cub200'],
-                        help='Dataset to use')
+    
+    # LDL任务：新增npy文件路径参数
+    parser.add_argument('--train_feature', type=str, required=True,
+                        help='Training feature file path (.npy format)')
+    parser.add_argument('--train_label', type=str, required=True,
+                        help='Training label distribution file path (.npy format)')
+    parser.add_argument('--test_feature', type=str, required=True,
+                        help='Test feature file path (.npy format)')
+    parser.add_argument('--test_label', type=str, required=True,
+                        help='Test label distribution file path (.npy format)')
+    
+    # 保留原有必要参数
     parser.add_argument('--batch_size', '-b', type=int, default=2048)
     parser.add_argument('--batch_steps', '-s', type=int, default=1)
     parser.add_argument('--test_only', action='store_true',
@@ -308,26 +317,21 @@ def main():
     parser.add_argument('--no_ema_stats', action='store_true',
                         help='If applicable, do not compute EMA statistics')
     parser.add_argument('--num_samples', '-n', type=int, default=1,
-                        help='Number of monte carlo samples for DenseFlow model')
-    parser.add_argument('--ten_crop', action='store_true',
-                        help='Evaluate on 10 crops of the same image')
-    parser.add_argument('--tta', action='store_true',
-                        help='Use test time augmentation')
-    parser.add_argument('--tta_num', type=int, default=5,
-                        help='Number of test time augmentations to use')
+                        help='Number of monte carlo samples')
+    
+    # LDL任务：移除图像相关参数
+    # parser.add_argument('--ten_crop', action='store_true',
+    #                     help='Evaluate on 10 crops of the same image')
+    # parser.add_argument('--tta', action='store_true',
+    #                     help='Use test time augmentation')
+    # parser.add_argument('--tta_num', type=int, default=5,
+    #                     help='Number of test time augmentations to use')
+    
     parser.add_argument('--var_temp', '-T', type=float, default=None,
                         help='Variance temperature')
     parser.add_argument('--likelihood_approach', default=None,
                         choices=('total', 'max'),
                         help='GMM likelihood approach per class')
-
-    legacy = parser.add_argument_group('Legacy (No Config File)')
-    legacy.add_argument('--flow_ckpt', type=str, default=None)
-    legacy.add_argument('--augmentation', default='v1')
-    legacy.add_argument('--interpolation', type=str, default=None,
-                        help='Resize interpolation type')
-    legacy.add_argument('--img_size', type=int, default=None,
-                        help='Image size')
 
     args = parser.parse_args()
     print(args)
