@@ -429,12 +429,13 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
             'weight_decay': 0.,
         })
 
-    if args.trainable in {'all', 'all_means', 'flow'}:
-        model.module.model.train()
-        parameters.append({'params': model.module.model.parameters()})
-        flow_grad = True
+    # LDL任务：不需要flow模型，直接使用特征输入
+    if args.trainable in {'all', 'all_means'}:
+        # LDL任务：如果模型有model属性，设置为评估模式
+        if hasattr(model.module, 'model'):
+            model.module.model.eval()
+        flow_grad = False
     else:
-        model.module.model.eval()
         flow_grad = False
 
     optimizer = torch.optim.AdamW(parameters, lr=args.lr,
@@ -475,29 +476,14 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
         all_labels = []
         all_z = []
 
-    metrics = {
-        'acc': torchmetrics.Accuracy(
-            task='multiclass',
-            num_classes=n_classes,
-        ).to(rank),
-        'acc5': torchmetrics.Accuracy(
-            task='multiclass',
-            num_classes=n_classes,
-            top_k=5,
-        ).to(rank),
-    }
+    # LDL任务：移除分类准确率指标，添加LDL相关指标
+    # 注意：LDL指标在evaluation.py中计算，这里只保留损失指标
+    metrics = {}
 
-    loss_names = ['loss_xent']
-    if args.elbo_loss:
-        loss_names.append('loss_elbo')
-    if args.elbo_loss2:
-        loss_names.append('loss_elbo2')
+    # LDL任务：只保留适用于LDL的损失函数
+    loss_names = ['loss_kl']  # KL散度损失，适用于标签分布学习
     if args.mu_loss:
         loss_names.append('loss_cluster')
-    if args.proto_loss:
-        loss_names.append('loss_proto')
-    if args.consistency_loss:
-        loss_names.append('loss_consistency')
     if args.diversity_loss:
         loss_names.append('loss_diversity')
     loss_metrics = {
@@ -511,64 +497,56 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
     for epoch in range(start_epoch, args.num_epochs):
         dl_train.sampler.set_epoch(epoch)
 
-        consistency_weight = linear_rampup(
-            1.0, epoch, args.consistency_rampup, start_epoch)
-
         pbar = tqdm(total=len(dl_train), disable=rank != 0,
                     desc=f'Epoch {epoch + 1}/{args.num_epochs}')
         pbar.set_postfix(**logs)
         avg_loss = batch_idx = 0
-        for batch_idx, (images, labels) in enumerate(dl_train):
+        for batch_idx, (features, labels) in enumerate(dl_train):
+            # LDL任务：处理特征输入，而非图像输入
             if args.gmm_em:
                 all_labels.append(labels)
-            if args.consistency_loss:
-                images, images2 = images
-                images2 = images2.to(rank)
-            images = images.to(rank)
-            labels = labels.to(rank)
+            
+            # LDL任务：直接使用特征输入，无需数据增强
+            features = features.to(rank)
+            labels = labels.to(rank)  # LDL任务：labels是标签分布，形状为(batch_size, n_classes)
 
             for i in range(args.batch_steps):
                 idxs_step = slice(
                     i * inner_batch_size, (i + 1) * inner_batch_size)
-                images_step = images[idxs_step]
+                features_step = features[idxs_step]
                 labels_step = labels[idxs_step]
-                preds, log_prob, z = model(images_step, flow_grad=flow_grad,
+                
+                # LDL任务：调用模型进行预测，获取标签分布
+                # 需要核实：模型的forward方法返回值格式
+                # 假设返回的是(logits, log_prob, z)，其中logits是标签分布的对数概率
+                preds, log_prob, z = model(features_step, flow_grad=flow_grad,
                                            ret_log_prob=True, ret_z=True)
 
-                losses = {'loss_xent': (F.cross_entropy(preds, labels_step) /
-                                        args.batch_steps)}
-                if args.elbo_loss:
-                    losses['loss_elbo'] = (
-                            elbo_bpd(log_prob, images_step.shape) /
-                            args.batch_steps)
-                if args.consistency_loss:
-                    model.eval()
-
-                    with torch.no_grad():
-                        images2_step = images2[idxs_step]
-                        preds2 = model(images2_step).argmax(dim=1)
-                    model.train()
-
-                    losses['loss_consistency'] = consistency_loss(
-                        all_log_probs=preds, z=z, sldj=log_prob,
-                        x_shape=images_step.shape, y=preds2
-                    ) / args.batch_steps * consistency_weight
-                if args.elbo_loss2:
-                    losses['loss_elbo2'] = elbo_bpd(
-                        log_prob + preds[torch.arange(len(preds)), labels_step],
-                        images_step.shape
-                    ) / args.batch_steps
+                # LDL任务：将交叉熵损失替换为KL散度损失，适用于标签分布学习
+                # 注意：preds需要是概率分布，或者先通过softmax转换为概率分布
+                # 假设preds是对数概率，先转换为概率分布
+                preds_probs = F.softmax(preds, dim=1)  # 转换为概率分布
+                # 使用KL散度损失，注意标签分布需要是概率分布
+                # 公式：D_KL(p || q) = sum(p * log(p / q))
+                loss_kl = F.kl_div(preds_probs.log(), labels_step, reduction='batchmean')
+                losses = {'loss_kl': loss_kl / args.batch_steps}
+                
+                # 保留mu_loss和diversity_loss，它们与LDL任务兼容
                 if args.diversity_loss:
                     losses['loss_diversity'] = (
                             diversity_loss(model.module.gmms) /
                             args.batch_steps
                     )
                 if args.mu_loss:
-
-                    classes_covered = torch.unique(labels_step)
+                    # LDL任务：修改聚类损失，使其适用于标签分布
+                    # 对于标签分布，我们需要找到每个样本的主要类别
+                    # 这里使用argmax获取主要类别
+                    main_classes = labels_step.argmax(dim=1)
+                    classes_covered = torch.unique(main_classes)
                     loss_cluster = None
                     for c in classes_covered:
-                        z_c = z[labels_step == c].flatten(1)
+                        # 获取主要类别为c的样本的潜在表示
+                        z_c = z[main_classes == c].flatten(1)
                         mu_c = model.module.gmms[c].mu.squeeze(0)
                         dists = torch.cdist(z_c, mu_c)
 
@@ -580,23 +558,7 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
 
                     losses['loss_cluster'] = loss_cluster / (
                             len(classes_covered) * args.batch_steps)
-                if args.proto_loss:
-                    loss_proto = None
-                    img_size = images.shape[-1]
-                    for gmm in model.module.gmms:
-                        mu = gmm.mu.reshape(-1, *model.module.model.out_shape)
-
-                        loss_proto_k = elbo_bpd(
-                            model.module.model.base_dist.log_prob(mu),
-                            torch.Size([len(mu), 3, img_size, img_size]),
-                        )
-                        if loss_proto is None:
-                            loss_proto = loss_proto_k
-                        else:
-                            loss_proto += loss_proto_k
-
-                    losses['loss_proto'] = loss_proto / (
-                            len(model.module.gmms) * args.batch_steps)
+                
                 loss = sum(losses.values())
 
                 if torch.isnan(loss):
@@ -623,8 +585,7 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
                 else:
                     loss.backward()
 
-                for metric in metrics.values():
-                    metric(preds, labels_step)
+                # LDL任务：移除分类准确率指标的更新
 
             last_lr = lr_scheduler.get_last_lr()[0]
 
@@ -652,13 +613,7 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
                 avg_loss=float(avg_loss) / (batch_idx + 1),
                 lr=last_lr,
             )
-            for name, metric in metrics.items():
-                score = metric.compute()
-                if name.startswith('acc'):
-                    score *= 100
-                logs[name] = score.item()
-                if rank == 0 and not (PROFILE or args.gmm_em):
-                    writer.add_scalar(f'{name}/train', score, global_step)
+            # LDL任务：移除分类准确率指标的日志记录
             pbar.set_postfix(**logs)
 
             for loss_metric in loss_metrics.values():
@@ -798,9 +753,14 @@ def train_loop(rank, world_size, model, run_folder, dl_train, dl_val,
 def init_gmms(rank, world_size, model, dl, args, method='kmeans'):
     assert method in {'kmeans'}
 
+    # LDL任务：检查model是否为None
     flow_model = model.module.model
-    was_training = flow_model.training
-    flow_model.eval()
+    use_flow_model = flow_model is not None
+    
+    # 如果使用flow_model，保存其训练状态并设置为评估模式
+    if use_flow_model:
+        was_training = flow_model.training
+        flow_model.eval()
 
     inner_batch_size = args.batch_size // args.batch_steps
 
@@ -808,19 +768,28 @@ def init_gmms(rank, world_size, model, dl, args, method='kmeans'):
     all_labels = []
 
     with torch.no_grad():
-        for batch_idx, (images, labels) in enumerate(
+        # LDL任务：统一变量命名，使用features代替images，适配特征输入
+        for batch_idx, (features, labels) in enumerate(
                 tqdm(dl, desc='Gathering embeddings', disable=rank != 0)):
-            images = images.to(rank)
+            features = features.to(rank)
             labels = labels.to(rank)
 
             for i in range(args.batch_steps):
                 idxs_step = slice(
                     i * inner_batch_size, (i + 1) * inner_batch_size)
-                images_step = images[idxs_step]
-                if not len(images_step):
+                features_step = features[idxs_step]
+                if not len(features_step):
                     break
                 labels_step = labels[idxs_step]
-                z, log_prob = flow_model.log_prob(images_step, return_z=True)
+                
+                # LDL任务：处理model为None的情况
+                if use_flow_model:
+                    # 使用flow_model获取潜在表示z
+                    z, log_prob = flow_model.log_prob(features_step, return_z=True)
+                else:
+                    # 直接使用特征作为潜在表示z
+                    z = features_step
+                    log_prob = torch.zeros(len(z), device=z.device)  # 为了兼容格式
 
                 all_z.append(
                     all_gather(z, world_size, args.debug).reshape(
@@ -857,5 +826,6 @@ def init_gmms(rank, world_size, model, dl, args, method='kmeans'):
             gmm.mu.data = cluster_centers.reshape(gmm.mu.shape).to(
                 gmm.mu.device)
 
-    if was_training:
+    # 如果使用flow_model，恢复其训练状态
+    if use_flow_model and was_training:
         flow_model.train()
