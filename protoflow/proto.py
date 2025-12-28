@@ -38,7 +38,7 @@ from protoflow.gmm import GaussianMixtureConv2d
 class ProtoFlowGMM(nn.Module):
     def __init__(
             self,
-            model: DenseFlow,
+            model: Optional[DenseFlow],
             n_classes: int,
             features_shape: Sequence[int],
             protos_per_class: int = 10,
@@ -95,8 +95,19 @@ class ProtoFlowGMM(nn.Module):
         if not len(x):
             return torch.empty((0, len(self.gmms)), dtype=x.dtype,
                                device=x.device)
-        with nullcontext() if flow_grad else torch.no_grad():
-            z, log_prob = self.model.log_prob(x, return_z=True)
+        
+        # LDL任务：如果model为None，直接将输入x作为潜在表示z
+        # 否则通过flow模型处理x获取z和log_prob
+        if self.model is None:
+            # 直接处理特征输入，x即为潜在表示z
+            z = x
+            # 为了兼容返回值格式，生成一个默认的log_prob
+            log_prob = torch.zeros(len(z), device=z.device)
+        else:
+            # 原始ProtoFlowGMM逻辑：通过flow模型获取潜在表示
+            with nullcontext() if flow_grad else torch.no_grad():
+                z, log_prob = self.model.log_prob(x, return_z=True)
+        
         z_flat = z.flatten(1)
         z_flat = self.z_dropout(z_flat)
         if self.likelihood_approach == 'total':
@@ -106,7 +117,6 @@ class ProtoFlowGMM(nn.Module):
             ]
         elif self.likelihood_approach == 'max':
             preds = [
-
                 gmm.log_prob_all(z_flat).max(dim=1).values
                 for gmm in self.gmms
             ]
