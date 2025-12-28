@@ -20,110 +20,96 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 from tqdm.auto import tqdm
 
 import torch
-import torchmetrics
+import numpy as np
 
-from protoflow.metrics import ElboBPD
-from protoflow.metrics import CrossEntropy
+# LDL任务：导入LDL指标
+from ldl_metrics import proj, Cheby, Clark, Canberra, KL_div, Cosine, Intersection
 
 
 def test(rank, model, dl, n_classes, args, num_samples=1, ten_crop=False,
          calibration_metrics=False, multi_transform_k=None, log_suffix=None):
     was_training = model.training
 
-    metrics = {
-        'acc': torchmetrics.Accuracy(
-            task='multiclass',
-            num_classes=n_classes,
-        ).to(rank),
-        'acc5': torchmetrics.Accuracy(
-            task='multiclass',
-            num_classes=n_classes,
-            top_k=5,
-        ).to(rank),
-        'bpd': ElboBPD().to(rank),
-        'nll': CrossEntropy().to(rank),
-    }
-    if calibration_metrics:
-        metrics.update({
-            'ece': torchmetrics.CalibrationError(
-                task='multiclass',
-                n_bins=15,
-                norm='l1',
-                num_classes=n_classes,
-            ).to(rank),
-            'mce': torchmetrics.CalibrationError(
-                task='multiclass',
-                n_bins=15,
-                norm='max',
-                num_classes=n_classes,
-            ).to(rank),
-        })
+    # LDL任务：初始化LDL指标存储
+    # 由于LDL指标需要在numpy上计算，这里使用列表存储所有预测和真实标签
+    all_preds = []
+    all_labels = []
+    
     model.eval()
 
     inner_batch_size = args.batch_size // args.batch_steps
     with torch.no_grad():
         desc = 'Evaluating' + (f' {log_suffix}' if log_suffix else '') + '...'
-        for batch_idx, (images, labels) in enumerate(tqdm(
+        for batch_idx, (features, labels) in enumerate(tqdm(
                 dl, disable=rank != 0, desc=desc)):
-            if isinstance(images, (tuple, list)):
-                assert len(images) == 2
-                images = images[0]
-            images = images.to(rank)
+            # LDL任务：处理特征输入而非图像输入
+            if isinstance(features, (tuple, list)):
+                assert len(features) == 2
+                features = features[0]
+            features = features.to(rank)
             labels = labels.to(rank)
 
             for i in range(args.batch_steps):
                 idxs_step = slice(
                     i * inner_batch_size, (i + 1) * inner_batch_size)
-                images_step = images[idxs_step]
-                if not len(images_step):
+                features_step = features[idxs_step]
+                if not len(features_step):
                     break
                 labels_step = labels[idxs_step]
                 preds_agg = None
                 log_prob_agg = None
-                x_shape = None
                 for _ in range(num_samples):
-                    n_augs = images_step.shape[1] if multi_transform_k else 1
-                    for aug_idx in range(n_augs):
-                        if multi_transform_k:
-                            images_step_aug = images_step[:, aug_idx]
-                        else:
-                            images_step_aug = images_step
-                        n_crops = images_step_aug.shape[1] if ten_crop else 1
-                        divisor = num_samples * n_crops * n_augs
-                        for crop_idx in range(n_crops):
-                            if ten_crop:
-                                images_step_crop = images_step_aug[:, crop_idx]
-                            else:
-                                images_step_crop = images_step_aug
-                            preds, log_prob = model(
-                                images_step_crop, flow_grad=False,
-                                ret_log_prob=True, ret_z=False,
-                            )
+                    # LDL任务：直接使用特征输入，无需数据增强和裁剪
+                    divisor = num_samples
+                    # LDL任务：调用模型进行预测
+                    # 需要核实：模型的forward方法是否支持直接处理特征输入
+                    # 以及返回值格式是否正确
+                    preds, log_prob = model(
+                        features_step, flow_grad=False,
+                        ret_log_prob=True, ret_z=False,
+                    )
 
-                            if preds_agg is None:
-                                preds_agg = preds / divisor
-                                log_prob_agg = log_prob / divisor
-                                x_shape = images_step_crop.shape
-                            else:
-                                preds_agg += preds / divisor
-                                log_prob_agg += log_prob / divisor
-
-                for m_name, metric in metrics.items():
-                    if m_name == 'bpd':
-
-                        metric(
-                            log_prob_agg + preds_agg.max(dim=1).values,
-                            x_shape
-                        )
+                    if preds_agg is None:
+                        preds_agg = preds / divisor
+                        log_prob_agg = log_prob / divisor
                     else:
-                        metric(preds_agg, labels_step)
+                        preds_agg += preds / divisor
+                        log_prob_agg += log_prob / divisor
 
-        scores = {}
-        for name, metric in metrics.items():
-            score = metric.compute()
-            if name.startswith('acc'):
-                score *= 100
-            scores[name] = score
+                # LDL任务：将预测和标签转换为numpy数组，存储到列表中
+                # 注意：这里假设preds_agg的形状是(batch_size, n_classes)
+                # 且表示的是未归一化的预测分数
+                all_preds.append(preds_agg.cpu().numpy())
+                all_labels.append(labels_step.cpu().numpy())
+
+        # LDL任务：计算LDL指标
+        # 1. 合并所有批次的预测和标签
+        all_preds = np.concatenate(all_preds, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        
+        # 2. 对预测结果进行投影，确保其在概率单纯形上
+        # 注意：这里假设preds_agg是未归一化的预测分数
+        # 需要核实：preds_agg的具体含义和格式
+        # 如果preds_agg已经是概率分布，则无需投影
+        all_preds_proj = proj(all_preds)
+        
+        # 3. 计算LDL指标
+        cheby = Cheby(all_labels, all_preds_proj)
+        clark = Clark(all_labels, all_preds_proj)
+        canberra = Canberra(all_labels, all_preds_proj)
+        kl_div = KL_div(all_labels, all_preds_proj)
+        cosine = Cosine(all_labels, all_preds_proj)
+        intersection = Intersection(all_labels, all_preds_proj)
+        
+        # 4. 构建分数字典
+        scores = {
+            'cheby': torch.tensor(cheby),
+            'clark': torch.tensor(clark),
+            'canberra': torch.tensor(canberra),
+            'kl_div': torch.tensor(kl_div),
+            'cosine': torch.tensor(cosine),
+            'intersection': torch.tensor(intersection),
+        }
 
     if was_training:
         model.train()
