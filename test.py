@@ -316,7 +316,7 @@ def main():
                         help='Only evaluation on the test split')
     parser.add_argument('--no_ema_stats', action='store_true',
                         help='If applicable, do not compute EMA statistics')
-    parser.add_argument('--num_samples', '-n', type=int, default=1,
+    parser.add_argument('--num_samples', '-n', type=int, default=10,
                         help='Number of monte carlo samples')
     
     # LDL任务：移除图像相关参数
