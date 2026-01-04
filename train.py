@@ -122,11 +122,13 @@ def run(args):
             import json
 
             import git
+            from sklearn.model_selection import KFold
 
             import torch
             from torch.nn.parallel import DistributedDataParallel as DDP
             from torch.utils.data import random_split
             from torch.utils.data import Subset
+            from torch.utils.data import DataLoader
 
             from experiments.image.model.model_flow import get_model
             from experiments.image.utils import set_seeds
@@ -200,6 +202,10 @@ def run(args):
                             'train_label': args.train_label,
                             'test_feature': args.test_feature,
                             'test_label': args.test_label,
+                            # 交叉验证参数
+                            'cv_folds': args.cv_folds,
+                            'cv_ratio': args.cv_ratio,
+                            'cv_seed': args.cv_seed,
                         }, fp, indent=2)
 
             # LDL任务：加载npy数据，获取标签分布的类别数
@@ -210,113 +216,255 @@ def run(args):
             train_features = np.load(train_feature_path)
             feature_dim = train_features.shape[1]  # 特征维度
             
-            # LDL任务：初始化模型，无需flow模型，直接使用ProtoFlowGMM处理特征
-            # 注意：这里需要确认ProtoFlowGMM是否可以直接处理特征输入
-            # 如果需要，可能需要修改ProtoFlowGMM或添加适配层
-            # 需要核实：ProtoFlowGMM是否可以直接处理特征输入，还是必须通过flow模型
-            # 目前假设ProtoFlowGMM可以直接处理特征输入
-            model = ProtoFlowGMM(
-                model=None,  # LDL任务：直接处理特征，无需flow模型
-                n_classes=n_classes,
-                features_shape=(feature_dim,),  # LDL任务：特征形状为(feature_dim,)
-                protos_per_class=args.protos_per_class,
-                gaussian_approach=args.gaussian_approach,
-                likelihood_approach=args.likelihood_approach,
-                proto_dropout_prob=args.proto_dropout_prob,
-                z_dropout_prob=args.z_dropout_prob,
-            )
-            model.to(rank)
-
-            if not args.debug:
-                model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-                model = DDP(model, device_ids=[rank],
-                            find_unused_parameters=(args.trainable == 'gmm'),
-                            broadcast_buffers=False)
-
-
-            else:
-                model.module = model
-
-            assert args.batch_size % args.batch_steps == 0, 'batch step must divide batch size evenly'
-
-            # LDL任务：使用NpyDataset加载训练数据
-            ds_train = NpyDataset(train_feature_path, train_label_path)
-            val_len = round(len(ds_train) * args.val_size)
-            if val_len == 0 and args.val_size != 0 and len(ds_train) > 1:
-                val_len = 1
-            if val_len != 0:
-                train_len = len(ds_train) - val_len
-                g = torch.Generator().manual_seed(42)
-                ds_train, ds_val = random_split(ds_train, [train_len, val_len],
-                                                generator=g)
-            else:
-                ds_val = None
-
-            if args.init_gmm:
-                if args.resume:
-                    print(
-                        f'Ignoring option --init_gmm {args.init_gmm} because we are '
-                        f'resuming training')
+            # 交叉验证逻辑
+            if args.cv_folds > 1:
+                print(f'Running {args.cv_folds}-fold cross-validation with train ratio {args.cv_ratio}')
+                
+                # 创建完整数据集
+                full_dataset = NpyDataset(train_feature_path, train_label_path)
+                
+                # 尝试加载train_index.npy，如果存在则使用它进行数据划分
+                train_index_path = train_feature_path.replace('train_feature.npy', 'train_index.npy')
+                if os.path.exists(train_index_path):
+                    print(f'Using train_index.npy for data splitting from {train_index_path}')
+                    train_indices = np.load(train_index_path)
+                    # 确保train_indices是一维数组
+                    if train_indices.ndim > 1:
+                        train_indices = train_indices.flatten()
+                    # 使用KFold对train_indices进行划分
+                    kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.cv_seed)
+                    cv_splits = list(kf.split(train_indices))
                 else:
-                    print('Load train data for GMM initialization')
-                    # LDL任务：无需数据增强，直接使用原始数据
-                    ds_train_init = NpyDataset(train_feature_path, train_label_path)
-                    if val_len != 0:
-                        ds_train_init = Subset(ds_train_init, ds_train.indices)
-                    dl_train_init = make_dataloader(
-                        ds_train_init, rank, world_size, args.batch_size,
-                        drop_last=True, shuffle=False, persistent_workers=False,
-                        num_workers=args.num_workers,
-                        prefetch_cuda=args.prefetch_cuda,
+                    # 使用KFold对原始数据进行交叉验证
+                    print(f'Using KFold for data splitting since train_index.npy not found')
+                    kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.cv_seed)
+                    cv_splits = list(kf.split(full_dataset.features))
+                
+                cv_results = []
+                
+                # 对每个fold进行训练和评估
+                for fold_idx, (train_indices, test_indices) in enumerate(cv_splits):
+                    print(f'\n=== Fold {fold_idx + 1}/{args.cv_folds} ===')
+                    
+                    # 为当前fold创建运行文件夹
+                    fold_run_folder = osp.join(run_folder, f'fold_{fold_idx}')
+                    if rank == 0:
+                        os.makedirs(fold_run_folder, exist_ok=True)
+                    
+                    # 分割训练集和测试集
+                    ds_train = Subset(full_dataset, train_indices)
+                    ds_test_fold = Subset(full_dataset, test_indices)
+                    
+                    # 初始化模型
+                    model = ProtoFlowGMM(
+                        model=None,  # LDL任务：直接处理特征，无需flow模型
+                        n_classes=n_classes,
+                        features_shape=(feature_dim,),  # LDL任务：特征形状为(feature_dim,)
+                        protos_per_class=args.protos_per_class,
+                        gaussian_approach=args.gaussian_approach,
+                        likelihood_approach=args.likelihood_approach,
+                        proto_dropout_prob=args.proto_dropout_prob,
+                        z_dropout_prob=args.z_dropout_prob,
                     )
-                    init_gmms(rank, world_size, model, dl_train_init, args,
-                              method=args.init_gmm)
+                    model.to(rank)
 
-                    del dl_train_init, ds_train_init
+                    if not args.debug:
+                        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+                        model = DDP(model, device_ids=[rank],
+                                    find_unused_parameters=(args.trainable == 'gmm'),
+                                    broadcast_buffers=False)
+                    else:
+                        model.module = model
 
-            dl_train = make_dataloader(ds_train, rank, world_size, args.batch_size,
+                    assert args.batch_size % args.batch_steps == 0, 'batch step must divide batch size evenly'
+                    
+                    # 处理验证集
+                    val_len = round(len(ds_train) * args.val_size)
+                    if val_len == 0 and args.val_size != 0 and len(ds_train) > 1:
+                        val_len = 1
+                    if val_len != 0:
+                        train_len = len(ds_train) - val_len
+                        g = torch.Generator().manual_seed(42)
+                        ds_train, ds_val = random_split(ds_train, [train_len, val_len],
+                                                        generator=g)
+                    else:
+                        ds_val = None
+                    
+                    # GMM初始化
+                    if args.init_gmm:
+                        if args.resume:
+                            print(
+                                f'Ignoring option --init_gmm {args.init_gmm} because we are '
+                                f'resuming training')
+                        else:
+                            print('Load train data for GMM initialization')
+                            ds_train_init = Subset(full_dataset, train_indices)
+                            if val_len != 0:
+                                ds_train_init = Subset(ds_train_init, ds_train.indices)
+                            dl_train_init = make_dataloader(
+                                ds_train_init, rank, world_size, args.batch_size,
+                                drop_last=True, shuffle=False, persistent_workers=False,
+                                num_workers=args.num_workers,
+                                prefetch_cuda=args.prefetch_cuda,
+                            )
+                            init_gmms(rank, world_size, model, dl_train_init, args,
+                                      method=args.init_gmm)
+                            del dl_train_init, ds_train_init
+                    
+                    # 创建数据加载器
+                    dl_train = make_dataloader(ds_train, rank, world_size, args.batch_size,
+                                           drop_last=True, shuffle=True,
+                                           num_workers=args.num_workers,
+                                           prefetch_cuda=args.prefetch_cuda)
+                    if ds_val is None:
+                        dl_val = None
+                    else:
+                        dl_val = make_dataloader(ds_val, rank, world_size, args.batch_size,
+                                         drop_last=False, shuffle=False,
+                                         num_workers=args.num_workers,
+                                         prefetch_cuda=args.prefetch_cuda)
+                    
+                    # 训练模型
+                    with torch.no_grad() if args.gmm_em else nullcontext():
+                        train_loop(
+                            rank=rank, world_size=world_size, model=model, run_folder=fold_run_folder,
+                            dl_train=dl_train, dl_val=dl_val, n_classes=n_classes, args=args,
+                        )
+                    
+                    # 评估模型
+                    if rank == 0:
+                        print('Test accuracy time for fold')
+                    dl_test_fold = make_dataloader(ds_test_fold, rank, world_size, args.batch_size,
+                                      num_workers=args.num_workers,
+                                      prefetch_cuda=args.prefetch_cuda)
+                    test_scores = test(
+                        rank=rank,
+                        model=model,
+                        dl=dl_test_fold,
+                        n_classes=n_classes,
+                        args=args,
+                    )
+                    
+                    if rank == 0:
+                        print(f'Fold {fold_idx + 1} EVALUATION STATS:')
+                        for name, score in test_scores.items():
+                            print(f'  {name}: {score.item():.3f}')
+                        
+                        # 保存当前fold的结果
+                        cv_results.append(test_scores)
+                
+                # 聚合交叉验证结果
+                if rank == 0 and cv_results:
+                    print('\n=== Cross-Validation Results ===')
+                    aggregated_results = {}
+                    for metric_name in cv_results[0].keys():
+                        metric_values = [result[metric_name].item() for result in cv_results]
+                        mean_val = np.mean(metric_values)
+                        std_val = np.std(metric_values)
+                        aggregated_results[metric_name] = (mean_val, std_val)
+                        print(f'{metric_name}: {mean_val:.3f} ± {std_val:.3f}')
+                    
+                    # 保存聚合结果
+                    cv_results_path = osp.join(run_folder, 'cv_results.json')
+                    with open(cv_results_path, 'w') as f:
+                        json.dump(aggregated_results, f, indent=2)
+                    print(f'\nCross-validation results saved to {cv_results_path}')
+            else:
+                # 非交叉验证模式，使用原有逻辑
+                # 初始化模型
+                model = ProtoFlowGMM(
+                    model=None,  # LDL任务：直接处理特征，无需flow模型
+                    n_classes=n_classes,
+                    features_shape=(feature_dim,),  # LDL任务：特征形状为(feature_dim,)
+                    protos_per_class=args.protos_per_class,
+                    gaussian_approach=args.gaussian_approach,
+                    likelihood_approach=args.likelihood_approach,
+                    proto_dropout_prob=args.proto_dropout_prob,
+                    z_dropout_prob=args.z_dropout_prob,
+                )
+                model.to(rank)
+
+                if not args.debug:
+                    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+                    model = DDP(model, device_ids=[rank],
+                                find_unused_parameters=(args.trainable == 'gmm'),
+                                broadcast_buffers=False)
+                else:
+                    model.module = model
+
+                assert args.batch_size % args.batch_steps == 0, 'batch step must divide batch size evenly'
+
+                # LDL任务：使用NpyDataset加载训练数据
+                ds_train = NpyDataset(train_feature_path, train_label_path)
+                val_len = round(len(ds_train) * args.val_size)
+                if val_len == 0 and args.val_size != 0 and len(ds_train) > 1:
+                    val_len = 1
+                if val_len != 0:
+                    train_len = len(ds_train) - val_len
+                    g = torch.Generator().manual_seed(42)
+                    ds_train, ds_val = random_split(ds_train, [train_len, val_len],
+                                                    generator=g)
+                else:
+                    ds_val = None
+
+                if args.init_gmm:
+                    if args.resume:
+                        print(
+                            f'Ignoring option --init_gmm {args.init_gmm} because we are '
+                            f'resuming training')
+                    else:
+                        print('Load train data for GMM initialization')
+                        # LDL任务：无需数据增强，直接使用原始数据
+                        ds_train_init = NpyDataset(train_feature_path, train_label_path)
+                        if val_len != 0:
+                            ds_train_init = Subset(ds_train_init, ds_train.indices)
+                        dl_train_init = make_dataloader(
+                            ds_train_init, rank, world_size, args.batch_size,
+                            drop_last=True, shuffle=False, persistent_workers=False,
+                            num_workers=args.num_workers,
+                            prefetch_cuda=args.prefetch_cuda,
+                        )
+                        init_gmms(rank, world_size, model, dl_train_init, args,
+                                  method=args.init_gmm)
+
+                        del dl_train_init, ds_train_init
+
+                dl_train = make_dataloader(ds_train, rank, world_size, args.batch_size,
                                        drop_last=True, shuffle=True,
                                        num_workers=args.num_workers,
                                        prefetch_cuda=args.prefetch_cuda)
-            if ds_val is None:
-                dl_val = None
-            else:
-                dl_val = make_dataloader(ds_val, rank, world_size, args.batch_size,
+                if ds_val is None:
+                    dl_val = None
+                else:
+                    dl_val = make_dataloader(ds_val, rank, world_size, args.batch_size,
                                          drop_last=False, shuffle=False,
                                          num_workers=args.num_workers,
                                          prefetch_cuda=args.prefetch_cuda)
 
-            with torch.no_grad() if args.gmm_em else nullcontext():
-                train_loop(
+                with torch.no_grad() if args.gmm_em else nullcontext():
+                    train_loop(
+                        rank=rank, world_size=world_size, model=model, run_folder=run_folder,
+                        dl_train=dl_train, dl_val=dl_val, n_classes=n_classes, args=args,
+                    )
+
+                if rank == 0:
+                    print('Test accuracy time')
+                # LDL任务：使用NpyDataset加载测试数据
+                ds_test = NpyDataset(test_feature_path, test_label_path)
+                dl_test = make_dataloader(ds_test, rank, world_size, args.batch_size,
+                                      num_workers=args.num_workers,
+                                      prefetch_cuda=args.prefetch_cuda)
+                test_scores = test(
                     rank=rank,
-                    world_size=world_size,
                     model=model,
-                    run_folder=run_folder,
-                    dl_train=dl_train,
-                    dl_val=dl_val,
+                    dl=dl_test,
                     n_classes=n_classes,
                     args=args,
                 )
-
-            if rank == 0:
-                print('Test accuracy time')
-            # LDL任务：使用NpyDataset加载测试数据
-            ds_test = NpyDataset(test_feature_path, test_label_path)
-            dl_test = make_dataloader(ds_test, rank, world_size, args.batch_size,
-                                      num_workers=args.num_workers,
-                                      prefetch_cuda=args.prefetch_cuda)
-            test_scores = test(
-                rank=rank,
-                model=model,
-                dl=dl_test,
-                n_classes=n_classes,
-                args=args,
-            )
-            if rank == 0:
-                print('EVALUATION STATS:')
-                for name, score in test_scores.items():
-                    print(f'  {name}: {score.item():.3f}')
+                if rank == 0:
+                    print('EVALUATION STATS:')
+                    for name, score in test_scores.items():
+                        print(f'  {name}: {score.item():.3f}')
     finally:
         cleanup(args.debug)
 
@@ -338,6 +486,14 @@ def main():
                         help='Test feature file path (.npy format)')
     parser.add_argument('--test_label', type=str, required=True,
                         help='Test label distribution file path (.npy format)')
+    
+    # 交叉验证参数
+    parser.add_argument('--cv_folds', type=int, default=5,
+                        help='Number of cross-validation folds')
+    parser.add_argument('--cv_ratio', type=float, default=0.6,
+                        help='Training set ratio for cross-validation')
+    parser.add_argument('--cv_seed', type=int, default=42,
+                        help='Random seed for cross-validation data splitting')
 
     # 保留原有必要参数
     parser.add_argument('--batch_size', '-b', type=int, default=32)
