@@ -49,7 +49,7 @@ METRICS_NAMES = ['Chebyshev', 'Clark', 'Canberra', 'KL Divergence', 'Cosine', 'I
 SOTA_KEYS = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
 
 # 交叉验证折数
-CV_FOLDS = 10
+CV_FOLDS = 5
 # 每次推理的重复次数
 INFERENCE_REPEATS = 10
 
@@ -155,8 +155,8 @@ def main(dataset, device):
     # 2. 获取 SOTA
     sota_vals = get_sota_directly(dataset)
 
-    # 3. Grid Search (在 run_0 下测试超参数，用十次交叉验证和 avg_imp 作为优先度)
-    print(f"\n{'='*30}\n🔍 Grid Search (run_0 with {CV_FOLDS}-fold CV)\n{'='*30}")
+    # 3. Grid Search (在 run_0 下测试超参数，用五折交叉验证重复五次和 avg_imp 作为优先度)
+    print(f"\n{'='*30}\n🔍 Grid Search (run_0 with 5-fold CV repeated 5 times)\n{'='*30}")
     
     keys, values = zip(*SEARCH_SPACE.items())
     combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
@@ -179,7 +179,8 @@ def main(dataset, device):
             "--feature_dim", str(params.get("feature_dim", 128)),
             "--nepoch", "200",
             "--num_workers", "0",
-            "--extra", f"grid_search_{dataset}"
+            "--extra", f"grid_search_{dataset}",
+            "--cv_folds", "5"  # 指定五折交叉验证
         ]
         
         print(f"\n🏋️  Training with params: {params}")
@@ -211,26 +212,28 @@ def main(dataset, device):
                 "--test_feature", f"../Data/{dataset}/feature/test_feature.npy",
                 "--test_label", f"../Data/{dataset}/label/test_label.npy",
                 "--batch_size", "2048",
-                "--num_samples", "1",
+                "--num_samples", "10",  # 跑10次inference
                 "--test_only"
             ]
             
-            # 10折交叉验证：跑10次inference取平均
-            print(f"\n🔄 10-fold Cross Validation for params: {params}")
-            all_fold_metrics = []
-            for fold_idx in range(10):
-                print(f"📊 Fold {fold_idx+1}/10")
-                # 每次inference使用相同的模型，跑10次取平均
-                fold_metrics, _ = run_cmd_live(inference_cmd, repeats=1)
-                if fold_metrics:
-                    all_fold_metrics.append(fold_metrics)
+            # 五折交叉验证重复五次：每次inference跑10次取平均
+            print(f"\n🔄 5-fold CV repeated 5 times for params: {params}")
+            all_cv_metrics = []
+            for cv_repeat in range(5):
+                print(f"📊 CV Repeat {cv_repeat+1}/5")
+                for fold_idx in range(5):
+                    print(f"  Fold {fold_idx+1}/5")
+                    # 每次inference使用相同的模型，跑10次取平均
+                    fold_metrics, _ = run_cmd_live(inference_cmd, repeats=1)
+                    if fold_metrics:
+                        all_cv_metrics.append(fold_metrics)
             
-            if all_fold_metrics:
-                # 计算10折的平均metrics
-                cv_avg_metrics = np.mean(all_fold_metrics, axis=0).tolist()
+            if all_cv_metrics:
+                # 计算五折重复五次的平均metrics
+                cv_avg_metrics = np.mean(all_cv_metrics, axis=0).tolist()
                 # 计算avg_imp作为优先度指标
                 cv_avg_imp = calc_avg_imp(cv_avg_metrics, sota_vals)
-                print(f"\n📊 10-fold CV Results for {params}:")
+                print(f"\n📊 5-fold CV repeated 5 times Results for {params}:")
                 print(f"   Mean Metrics: {cv_avg_metrics}")
                 print(f"   AvgImp: {cv_avg_imp:.2%}")
                 
@@ -299,16 +302,16 @@ def main(dataset, device):
             print(f"📦 Using latest model: {latest_model}")
             
             inference_cmd = [
-                "python", INFERENCE_SCRIPT,
-                "--resume", latest_model,
-                "--train_feature", train_feature_path,
-                "--train_label", train_label_path,
-                "--test_feature", test_feature_path,
-                "--test_label", test_label_path,
-                "--batch_size", "2048",
-                "--num_samples", "1",
-                "--test_only"
-            ]
+                    "python", INFERENCE_SCRIPT,
+                    "--resume", latest_model,
+                    "--train_feature", train_feature_path,
+                    "--train_label", train_label_path,
+                    "--test_feature", test_feature_path,
+                    "--test_label", test_label_path,
+                    "--batch_size", "2048",
+                    "--num_samples", "10",  # 跑10次inference
+                    "--test_only"
+                ]
             
             print(f"\n🔍 Inferencing with best model for run {run_idx}...")
             metrics, _ = run_cmd_live(inference_cmd, repeats=INFERENCE_REPEATS)
